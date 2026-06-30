@@ -648,6 +648,8 @@ function enterApp() {
   document.getElementById('main-screen').classList.add('active');
   renderTodos();
   renderMemory();
+  requestNotifyPermission();
+  getLocation();
 }
 
 document.getElementById('logout-btn').addEventListener('click', () => {
@@ -678,6 +680,155 @@ function getPeriod() {
   return 'night';
 }
 
+// ===== REAL DATA: GEOLOCATION + WEATHER =====
+let cachedLocation = null;
+
+function getLocation() {
+  return new Promise((resolve) => {
+    if (cachedLocation) return resolve(cachedLocation);
+    if (!navigator.geolocation) return resolve(null);
+    navigator.geolocation.getCurrentPosition(
+      pos => {
+        cachedLocation = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+        resolve(cachedLocation);
+      },
+      () => resolve(null),
+      { timeout: 8000 }
+    );
+  });
+}
+
+async function getRealWeather() {
+  const loc = await getLocation();
+  if (!loc) return "Location unavailable — enable Location Services for Safari in Settings to get real weather.";
+  try {
+    const res = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${loc.lat}&longitude=${loc.lon}&current=temperature_2m,weather_code,wind_speed_10m&temperature_unit=fahrenheit`);
+    const data = await res.json();
+    const temp = Math.round(data.current.temperature_2m);
+    const wind = Math.round(data.current.wind_speed_10m);
+    const code = data.current.weather_code;
+    const conditions = {
+      0: 'Clear sky', 1: 'Mainly clear', 2: 'Partly cloudy', 3: 'Overcast',
+      45: 'Foggy', 48: 'Foggy', 51: 'Light drizzle', 61: 'Rain', 63: 'Rain',
+      65: 'Heavy rain', 71: 'Snow', 80: 'Rain showers', 95: 'Thunderstorm'
+    };
+    const desc = conditions[code] || 'Conditions unclear';
+    return `${temp}°F, ${desc}, wind ${wind} mph`;
+  } catch (e) {
+    return "Weather lookup failed: " + e.message;
+  }
+}
+
+// ===== REAL DATA: WEB SEARCH =====
+async function realWebSearch(query) {
+  try {
+    const res = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`);
+    const data = await res.json();
+    let results = [];
+    if (data.AbstractText) {
+      results.push(`${data.Heading || 'Answer'}: ${data.AbstractText}`);
+    }
+    (data.RelatedTopics || []).slice(0, 4).forEach(t => {
+      if (t.Text) results.push(t.Text);
+    });
+    return results.length ? results.join('\n\n') : "No results found.";
+  } catch (e) {
+    return "Search failed: " + e.message;
+  }
+}
+
+// ===== REAL DATA: STOCKS =====
+async function realStockPrice(symbol) {
+  try {
+    const res = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol.toUpperCase()}?interval=1d&range=1d`);
+    const data = await res.json();
+    const meta = data.chart.result[0].meta;
+    const price = meta.regularMarketPrice;
+    const prev = meta.chartPreviousClose || price;
+    const change = ((price - prev) / prev * 100);
+    const arrow = change >= 0 ? '▲' : '▼';
+    return `${symbol.toUpperCase()}: $${price.toFixed(2)} ${arrow} ${Math.abs(change).toFixed(2)}%`;
+  } catch (e) {
+    return `Could not fetch ${symbol}: ${e.message}`;
+  }
+}
+
+// ===== PUSH NOTIFICATIONS =====
+async function requestNotifyPermission() {
+  if (!('Notification' in window)) return false;
+  if (Notification.permission === 'granted') return true;
+  const perm = await Notification.requestPermission();
+  return perm === 'granted';
+}
+
+function sendNotification(title, body) {
+  if ('Notification' in window && Notification.permission === 'granted') {
+    new Notification(title, { body, icon: 'data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'%3E%3Crect width=\'100\' height=\'100\' fill=\'%23000\'/%3E%3Ctext x=\'50\' y=\'68\' font-size=\'60\' text-anchor=\'middle\' fill=\'%2300e5ff\'%3E%E2%9A%A1%3C/text%3E%3C/svg%3E' });
+  }
+}
+
+// ===== TOOL DEFINITIONS FOR GROQ =====
+const WEB_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "get_weather",
+      description: "Get the current real weather at the user's actual location using GPS.",
+      parameters: { type: "object", properties: {}, required: [] }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "web_search",
+      description: "Search the web for current information.",
+      parameters: {
+        type: "object",
+        properties: { query: { type: "string", description: "Search query" } },
+        required: ["query"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_stock",
+      description: "Get the real current price of a stock or crypto symbol.",
+      parameters: {
+        type: "object",
+        properties: { symbol: { type: "string", description: "Ticker symbol e.g. AAPL, BTC-USD" } },
+        required: ["symbol"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "send_notification",
+      description: "Send a push notification to the user's phone.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Notification title" },
+          body: { type: "string", description: "Notification message" }
+        },
+        required: ["title", "body"]
+      }
+    }
+  }
+];
+
+async function dispatchWebTool(name, args) {
+  if (name === 'get_weather') return await getRealWeather();
+  if (name === 'web_search') return await realWebSearch(args.query);
+  if (name === 'get_stock') return await realStockPrice(args.symbol);
+  if (name === 'send_notification') {
+    sendNotification(args.title, args.body);
+    return `✓ Notification sent: ${args.title}`;
+  }
+  return "Unknown tool.";
+}
+
 // ===== GROQ CHAT =====
 async function callGroq(messages) {
   const apiKey = localStorage.getItem('volt_api_key');
@@ -699,24 +850,42 @@ Personality:
 - Detect sarcasm and match energy with dry wit
 - Never say "As you wish, Sir" outside of APEX Protocol
 
-You can discuss weather, calendar, music, messages, notes, memory, to-dos, web info, and general tasks. You don't have live tool access in this web version — answer from your knowledge and be upfront if something needs the desktop Volt agent.${memStr}`;
+You have real tools: get_weather (uses GPS), web_search (real results), get_stock (real prices), send_notification (real push notification). Use them whenever relevant — never guess or fake this data when a tool can get the real answer. You don't have access to Mac-only features like iMessage, Apple Music control, or shell commands in this web version — be upfront if those are needed and suggest the desktop Volt agent.${memStr}`;
+
+  let convo = [{ role: 'system', content: systemPrompt }, ...messages];
 
   try {
-    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-        max_tokens: 1024,
-        messages: [{ role: 'system', content: systemPrompt }, ...messages]
-      })
-    });
-    const data = await res.json();
-    if (data.error) return `Error: ${data.error.message}`;
-    return data.choices[0].message.content;
+    while (true) {
+      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+          max_tokens: 1024,
+          messages: convo,
+          tools: WEB_TOOLS
+        })
+      });
+      const data = await res.json();
+      if (data.error) return `Error: ${data.error.message}`;
+
+      const msg = data.choices[0].message;
+
+      if (!msg.tool_calls || msg.tool_calls.length === 0) {
+        return msg.content;
+      }
+
+      convo.push(msg);
+
+      for (const tc of msg.tool_calls) {
+        const args = JSON.parse(tc.function.arguments || '{}');
+        const result = await dispatchWebTool(tc.function.name, args);
+        convo.push({ role: 'tool', tool_call_id: tc.id, content: result });
+      }
+    }
   } catch (e) {
     return `Connection error: ${e.message}`;
   }
